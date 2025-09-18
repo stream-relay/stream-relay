@@ -1,0 +1,9 @@
+.idea
+node_modules
+/example/client/bin/
+/example/pipe-compression-test/bin/
+/example/pipe-browser-test/bin/
+/example/pipe-browser-test/public/pipe-client.js
+/server-go/stream-relay-server
+/.DS_Store
+server-go/stream-relay

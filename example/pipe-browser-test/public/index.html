@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pipe Client BodyDict Compression Test</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d4ff; margin-bottom: 5px; }
+    .subtitle { color: #888; margin-bottom: 20px; }
+    .config {
+      background: #16213e;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    .config label { display: block; margin-bottom: 5px; color: #aaa; }
+    .config input, .config select {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #333;
+      border-radius: 4px;
+      background: #0f0f23;
+      color: #fff;
+      margin-bottom: 10px;
+    }
+    .buttons { margin-bottom: 20px; }
+    button {
+      background: #00d4ff;
+      color: #000;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-bottom: 10px;
+      font-weight: bold;
+    }
+    button:hover { background: #00a8cc; }
+    button:disabled { background: #444; color: #888; cursor: not-allowed; }
+    .output {
+      background: #0f0f23;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 15px;
+      min-height: 300px;
+      white-space: pre-wrap;
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 13px;
+      overflow-y: auto;
+      max-height: 500px;
+    }
+    .success { color: #00ff88; }
+    .error { color: #ff4444; }
+    .info { color: #00d4ff; }
+    .metric { color: #ffaa00; }
+    .separator { color: #444; }
+  </style>
+</head>
+<body>
+  <h1>Pipe Client Browser Test</h1>
+  <p class="subtitle">Browser SDK with BodyDict deduplication + long connection streaming</p>
+
+  <div class="config">
+    <label>Relay Server URL:</label>
+    <input type="text" id="relayUrl" value="http://localhost:29998">
+    <label>Echo Target URL (via relay):</label>
+    <input type="text" id="echoUrl" value="http://localhost:4001/echo">
+    <label>SSE Target URL (via relay):</label>
+    <input type="text" id="sseUrl" value="http://localhost:4001/sse">
+    <label>Number of LLM conversation rounds:</label>
+    <select id="numRounds">
+      <option value="5">5 rounds</option>
+      <option value="10" selected>10 rounds</option>
+      <option value="20">20 rounds</option>
+    </select>
+  </div>
+
+  <div class="buttons">
+    <button onclick="runLLMSimulation()">Run LLM Simulation</button>
+    <button onclick="runStreamTest()">Test SSE Stream (30s)</button>
+    <button onclick="fetchMetrics()">Fetch Metrics</button>
+    <button onclick="clearOutput()">Clear</button>
+  </div>
+
+  <div class="output" id="output"></div>
+
+  <script src="pipe-client.js"></script>
+  <script>
+    const output = document.getElementById('output');
+    let client = null;
+
+    function log(msg, cls = '') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = msg + '\n';
+      output.appendChild(span);
+      output.scrollTop = output.scrollHeight;
+    }
+
+    function clearOutput() {
+      output.innerHTML = '';
+    }
+
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i];
+    }
+
+    function getRelayUrl() {
+      return document.getElementById('relayUrl').value.replace(/\/+$/, '');
+    }
+
+    function getEchoUrl() {
+      return document.getElementById('echoUrl').value;
+    }
+
+    function getSseUrl() {
+      return document.getElementById('sseUrl').value;
+    }
+
+    function getNumRounds() {
+      return parseInt(document.getElementById('numRounds').value, 10);
+    }
+
+    // System prompt and response template for LLM simulation
+    const systemPrompt = `You are a helpful AI assistant. You specialize in answering questions about software engineering, system design, and best practices. When asked a question, you provide detailed, well-structured responses with examples and explanations.`;
+
+    const responseTemplate = `Caching is a critical technique in distributed systems that improves performance by reducing latency and load on backend services.
+
+## Caching Strategies
+
+### LRU (Least Recently Used)
+- Evicts the least recently accessed items when cache is full
+- Good for temporal locality patterns
+- O(1) access time with hash table + doubly linked list
+
+### LFU (Least Frequently Used)
+- Tracks access frequency
+- Better for skewed access patterns
+- Slightly more overhead than LRU
+
+### TTL-based Eviction
+- Items automatically expire after time duration
+- Simple to implement
+- Useful for data that changes periodically
+
+## Cache Invalidation Challenges
+
+The famous quote: "There are only two hard things in Computer Science: cache invalidation and naming things."
+
+Cache invalidation can be solved by:
+1. Time-based expiration (TTL)
+2. Event-based invalidation (push invalidation)
+3. Dependency-based invalidation
+
+## Best Practices
+
+- Use write-through caching for critical data
+- Implement cache warming strategies
+- Monitor cache hit rates
+- Plan for cache misses in your system design
+- Use cache stampede prevention techniques
+
+When designing a system, remember that cache is not a replacement for correct data management but rather a performance optimization layer.`;
+
+    // Build conversation history up to round N (like real LLM agents send full history)
+    function buildConversation(round) {
+      const messages = [{ role: 'system', content: systemPrompt }];
+      for (let i = 1; i <= round; i++) {
+        messages.push({
+          role: 'user',
+          content: `Question ${i}: Can you explain how caching works in distributed systems? I want to understand the different strategies like LRU, LFU, and TTL-based eviction. Also explain how cache invalidation challenges affect system design.`
+        });
+        messages.push({ role: 'assistant', content: responseTemplate });
+      }
+      return { messages };
+    }
+
+    async function fetchMetrics() {
+      const relayUrl = getRelayUrl();
+      try {
+        const resp = await fetch(`${relayUrl}/debug/vars`);
+        if (!resp.ok) {
+          log(`Failed to fetch metrics: ${resp.status}`, 'error');
+          return null;
+        }
+        const metrics = await resp.json();
+        log('--- Server Metrics ---', 'separator');
+        log(`  Chunks stored:     ${metrics.dict_put_chunks_total || 0}`, 'metric');
+        log(`  Bytes stored:      ${formatBytes(metrics.dict_put_bytes_total || 0)}`, 'metric');
+        log(`  Chunks hit:        ${metrics.dict_hit_chunks_total || 0}`, 'metric');
+        log(`  Missing errors:    ${metrics.dict_missing_errors_total || 0}`, 'metric');
+        log(`  Reconstructed:     ${formatBytes(metrics.dict_reconstructed_bytes_total || 0)}`, 'metric');
+        return metrics;
+      } catch (e) {
+        log(`Error fetching metrics: ${e.message}`, 'error');
+        return null;
+      }
+    }
+
+    async function fetchMetricsQuiet() {
+      const relayUrl = getRelayUrl();
+      try {
+        const resp = await fetch(`${relayUrl}/debug/vars`);
+        if (!resp.ok) return null;
+        return await resp.json();
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function initClient() {
+      // Always create fresh client to reset knownRefs
+      const relayUrl = getRelayUrl();
+      log(`Initializing pipe client (relay: ${relayUrl})`, 'info');
+      client = PipeClient.createPipeClient({
+        serverBase: relayUrl,
+        bodyDictEnabled: true,
+        bodyDictMinSize: 1024
+      });
+      await client.init();
+      log('Client initialized\n', 'success');
+      return client;
+    }
+
+    async function runLLMSimulation() {
+      try {
+        const numRounds = getNumRounds();
+        const echoUrl = getEchoUrl();
+
+        log('========================================', 'separator');
+        log(`LLM Conversation Simulation (${numRounds} rounds)`, 'info');
+        log('========================================', 'separator');
+        log('Each request sends FULL conversation history', 'info');
+        log('(like real LLM agents). BodyDict deduplicates', 'info');
+        log('repeated messages across requests.\n', 'info');
+
+        // Fresh client to reset knownRefs
+        const c = await initClient();
+
+        const beforeMetrics = await fetchMetricsQuiet();
+        let totalOriginalBytes = 0;
+        let totalWireBytes = 0;
+
+        for (let round = 1; round <= numRounds; round++) {
+          const conversation = buildConversation(round);
+          const jsonStr = JSON.stringify(conversation);
+          const originalSize = jsonStr.length;
+          totalOriginalBytes += originalSize;
+
+          const roundBefore = await fetchMetricsQuiet();
+
+          const result = await c.start({
+            url: echoUrl,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: conversation,
+            onDelta: () => {},
+            onDone: () => {}
+          });
+          await result.ack();
+
+          // Wait for server metrics to update
+          await new Promise(r => setTimeout(r, 50));
+          const roundAfter = await fetchMetricsQuiet();
+
+          // Calculate wire bytes for this round
+          const putBytesDelta = (roundAfter?.dict_put_bytes_total || 0) - (roundBefore?.dict_put_bytes_total || 0);
+          const hitChunksDelta = (roundAfter?.dict_hit_chunks_total || 0) - (roundBefore?.dict_hit_chunks_total || 0);
+
+          // Wire bytes = new chunks stored (if any), otherwise ~0 for refs only
+          // For accurate wire measurement, we estimate based on what was sent
+          const wireBytes = putBytesDelta > 0 ? putBytesDelta : (hitChunksDelta > 0 ? 100 : originalSize);
+          totalWireBytes += wireBytes;
+
+          const savings = originalSize > 0 ? ((1 - wireBytes / originalSize) * 100).toFixed(1) : 0;
+
+          if (putBytesDelta > 0) {
+            log(`  Round ${round}: ${formatBytes(originalSize)} -> ${formatBytes(wireBytes)} (new chunks stored)`, 'info');
+          } else if (hitChunksDelta > 0) {
+            log(`  Round ${round}: ${formatBytes(originalSize)} -> ~refs only (${savings}% saved, ${hitChunksDelta} chunks reused)`, 'success');
+          } else {
+            log(`  Round ${round}: ${formatBytes(originalSize)} (no dedup - below threshold)`, 'info');
+          }
+        }
+
+        const afterMetrics = await fetchMetricsQuiet();
+
+        log('\n--- Summary ---', 'separator');
+        log(`  Total original bytes: ${formatBytes(totalOriginalBytes)}`, 'metric');
+
+        if (beforeMetrics && afterMetrics) {
+          const totalPutBytes = (afterMetrics.dict_put_bytes_total || 0) - (beforeMetrics.dict_put_bytes_total || 0);
+          const totalHitChunks = (afterMetrics.dict_hit_chunks_total || 0) - (beforeMetrics.dict_hit_chunks_total || 0);
+          const totalReconstructed = (afterMetrics.dict_reconstructed_bytes_total || 0) - (beforeMetrics.dict_reconstructed_bytes_total || 0);
+
+          log(`  Actual wire bytes:    ${formatBytes(totalPutBytes)}`, 'metric');
+          log(`  Chunks reused:        ${totalHitChunks}`, 'metric');
+
+          if (totalReconstructed > 0 && totalPutBytes > 0) {
+            const ratio = (totalPutBytes / totalReconstructed * 100).toFixed(1);
+            const factor = (totalReconstructed / totalPutBytes).toFixed(1);
+            log(`  Compression ratio:    ${ratio}% (${factor}x deduplication)`, 'success');
+          }
+        }
+
+        log('\n========================================', 'separator');
+        log('Simulation completed', 'success');
+
+      } catch (e) {
+        log(`Error: ${e.message}`, 'error');
+        console.error(e);
+      }
+    }
+
+    async function runStreamTest() {
+      try {
+        // Use existing client or create new one
+        if (!client) {
+          const relayUrl = getRelayUrl();
+          client = PipeClient.createPipeClient({
+            serverBase: relayUrl,
+            bodyDictEnabled: true,
+            bodyDictMinSize: 1024
+          });
+          await client.init();
+        }
+        const c = client;
+        const sseUrl = getSseUrl();
+
+        log('\n========================================', 'separator');
+        log('SSE Long Connection Test (30 seconds)', 'info');
+        log('========================================', 'separator');
+        log(`Target: ${sseUrl}`, 'info');
+        log('This tests that long-running streams work correctly', 'info');
+        log('and are not affected by HTTP timeouts.\n', 'info');
+
+        const startTime = Date.now();
+        let eventCount = 0;
+
+        await new Promise((resolve, reject) => {
+          c.start({
+            url: sseUrl,
+            method: 'GET',
+            headers: {},
+            body: null,
+            onDelta: (chunk, meta) => {
+              const text = new TextDecoder().decode(chunk);
+              const lines = text.split('\n');
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  try {
+                    const data = JSON.parse(line.substring(6));
+                    if (data.done) {
+                      log(`Stream completed after ${eventCount} events`, 'success');
+                    } else if (data.count) {
+                      eventCount++;
+                      log(`  Event ${data.count}/${data.max} (${((Date.now() - startTime) / 1000).toFixed(1)}s elapsed)`, 'info');
+                    }
+                  } catch (e) {
+                    // Ignore parse errors for partial chunks
+                  }
+                }
+              }
+            },
+            onDone: (err) => {
+              if (err) {
+                log(`Stream error: ${err.message}`, 'error');
+                reject(err);
+              } else {
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                log(`\nLong connection test PASSED`, 'success');
+                log(`  Total events received: ${eventCount}`, 'metric');
+                log(`  Total time: ${elapsed}s`, 'metric');
+                log(`  No timeout issues!`, 'success');
+                resolve();
+              }
+            }
+          }).then(handle => {
+            handle.ack().catch(() => {});
+          });
+        });
+
+      } catch (e) {
+        log(`Error: ${e.message}`, 'error');
+      }
+    }
+
+    // Auto-init on page load
+    log('BodyDict Deduplication Test Ready', 'info');
+    log('Click "Run LLM Simulation" to test cross-request deduplication\n', 'info');
+  </script>
+</body>
+</html>

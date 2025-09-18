@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Document</title>
+
+    <script src="./stream-relay-client.js"></script>
+
+    <script>
+        // Minimal demo: forwards through the Go relay server at localhost:29999
+        // Configure your own serverBase/upstream URL and headers (e.g., Authorization).
+        const relay = StreamRelay.createStreamRelayClient({ serverBase: 'http://127.0.0.1:29999' });
+
+        relay.post('https://api.example.com/v1/messages', {
+            model: 'example-model',
+            stream: true,
+            messages: [{ role: 'user', content: 'Hello from the browser SDK' }]
+        }, {
+            responseType: 'sse',
+            headers: {
+                // Provide your own auth here, e.g. Authorization: 'Bearer <token>'
+            },
+            onOpen() { console.log('SSE open'); },
+            onMessage(evt) { console.log('[event]', evt.data); },
+            onError(err) { console.error('[sse error]', err); }
+        }).then(function (res) {
+            console.log('status', res.status);
+        }).catch(function (err) {
+            console.error('request failed', err);
+        });
+    </script>
+</head>
+<body>
+
+</body>
+</html>
