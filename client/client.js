@@ -55,6 +55,17 @@ function buildUpstreamUrl(req) {
     return u.toString();
 }
 
+function responseMustNotHaveBody(statusCode) {
+    return (statusCode >= 100 && statusCode < 200) || statusCode === 204 || statusCode === 304;
+}
+
+function setResponseHeaders(res, statusCode, contentType) {
+    res.statusCode = statusCode || 200;
+    if (!responseMustNotHaveBody(res.statusCode)) {
+        res.setHeader('Content-Type', contentType || 'application/octet-stream');
+    }
+}
+
 const MAX_INBOUND_BODY_BYTES = toPositiveInt(process.env.MAX_INBOUND_BODY_BYTES, 10 * 1024 * 1024);
 
 const pipe = createPipeClient({ serverBase: SERVER_BASE, waitMs: LONG_POLL_TIMEOUT_MS, profiling: PIPE_PROFILE });
@@ -120,7 +131,7 @@ const server = http.createServer(async (req, res) => {
 
         const headers = stripHopByHop(req.headers);
 
-        let originStatus = 200, originCT = 'application/octet-stream';
+        let originStatus, originCT;
 
         streamHandle = await pipe.start({
             url, method, headers, body,
@@ -129,12 +140,11 @@ const server = http.createServer(async (req, res) => {
                 if (res.destroyed || res.writableEnded) return;
 
                 if (!res.headersSent) {
-                    res.statusCode = meta.originStatus || 200;
-                    res.setHeader('Content-Type', meta.originContentType || 'application/octet-stream');
+                    setResponseHeaders(res, meta.originStatus || 200, meta.originContentType);
                     res.setHeader('Cache-Control', 'no-cache, no-transform');
                     res.setHeader('Connection', 'keep-alive');
-                    originStatus = meta.originStatus || originStatus;
-                    originCT = meta.originContentType || originCT;
+                    originStatus = meta.originStatus ?? originStatus;
+                    originCT = meta.originContentType ?? originCT;
                 }
                 const ok = res.write(chunk);
                 if (!ok && !res.destroyed) {
@@ -150,9 +160,8 @@ const server = http.createServer(async (req, res) => {
                     if (!res.headersSent && !res.destroyed) {
                         // Use meta from terminal frame for empty-body responses (e.g., 204, 500 with no body)
                         const finalStatus = meta?.originStatus ?? originStatus ?? 200;
-                        const finalCT = meta?.originContentType ?? originCT ?? 'application/octet-stream';
-                        res.statusCode = err ? 502 : finalStatus;
-                        res.setHeader('Content-Type', finalCT);
+                        const finalCT = meta?.originContentType ?? originCT;
+                        setResponseHeaders(res, err ? 502 : finalStatus, finalCT);
                     }
                     if (!res.writableEnded) {
                         res.end();
